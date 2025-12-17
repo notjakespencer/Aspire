@@ -11,6 +11,11 @@
         "Path": "Api\\Api.csproj",
         "Action": "Start",
         "DebugTarget": "https"
+      },
+      {
+        "Path": "ServiceDefaults\\ServiceDefaults.csproj",
+        "Action": "StartWithoutDebugging",
+        "DebugTarget": "ServiceDefaults"
       }
     ]
   }
