@@ -1,45 +1,75 @@
-﻿using System.Text.Json;
-using System.Web;
+﻿using Api.Data;
+using Api.Diagnostics;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.Extensions.Caching.Memory;
-using Api.Data;
+using Microsoft.Extensions.Logging;
+using System.Diagnostics;
+using System.Text.Json;
+using System.Web;
 
 namespace Api
 {
-    public class NwsManager(HttpClient httpClient, IMemoryCache cache, IWebHostEnvironment webHostEnvironment)
+    public class NwsManager(HttpClient httpClient, 
+        IMemoryCache cache, 
+        IWebHostEnvironment webHostEnvironment,
+        ILogger<NwsManager> logger)
     {
         private static readonly JsonSerializerOptions options = new(JsonSerializerDefaults.Web);
 
         public async Task<Zone[]?> GetZonesAsync()
         {
+            using var activity = NwsManagerDiagnostics.activitySource.StartActivity("GetZonesAsync");
+
+            logger.LogInformation("🚀 Starting zones retrieval with {CacheExpiration} cache expiration", TimeSpan.FromHours(1));
+
+            // Check if data exists in cache first
+            if (cache.TryGetValue("zones", out Zone[]? cachedZones))
+            {
+                // Record cache hit
+                NwsManagerDiagnostics.cacheHitCounter.Add(1);
+                activity?.SetTag("cache.hit", true);
+
+                logger.LogInformation("📈 Retrieved {ZoneCount} zones from cache (cache hit)", cachedZones?.Length ?? 0);
+                return cachedZones;
+            }
+
             return await cache.GetOrCreateAsync("zones", async entry =>
             {
                 entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(1);
 
-                // To get the live zone data from NWS, uncomment the following code and comment out the return statement below.
-                // This is required if you are deploying to ACA.
-                //var zones = await httpClient.GetFromJsonAsync<ZonesResponse>("https://api.weather.gov/zones?type=forecast", options);
-                //return zones?.Features
-                //            ?.Where(f => f.Properties?.ObservationStations?.Count > 0)
-                //            .Select(f => (Zone)f)
-                //            .Distinct()
-                //            .ToArray() ?? [];
+                // Record cache miss when we need to load from file
+                NwsManagerDiagnostics.cacheMissCounter.Add(1);
+                activity?.SetTag("cache.hit", false);
 
-                // Deserialize the zones.json file from the wwwroot folder
                 var zonesFilePath = Path.Combine(webHostEnvironment.WebRootPath, "zones.json");
                 if (!File.Exists(zonesFilePath))
                 {
+                    logger.LogWarning("⚠️ Zones file not found at {ZonesFilePath}", zonesFilePath);
                     return [];
                 }
 
                 using var zonesJson = File.OpenRead(zonesFilePath);
                 var zones = await JsonSerializer.DeserializeAsync<ZonesResponse>(zonesJson, options);
 
-                return zones?.Features
-                            ?.Where(f => f.Properties?.ObservationStations?.Count > 0)
-                            .Select(f => (Zone)f)
-                            .Distinct()
-                            .ToArray() ?? [];
+                if (zones?.Features == null)
+                {
+                    logger.LogWarning("⚠️ Failed to deserialize zones from file");
+                    return [];
+                }
+
+                var filteredZones = zones.Features
+                    .Where(f => f.Properties?.ObservationStations?.Count > 0)
+                    .Select(f => (Zone)f)
+                    .Distinct()
+                    .ToArray();
+
+                logger.LogInformation(
+                    "📊 Retrieved {TotalZones} zones, {FilteredZones} after filtering (cache miss)",
+                    zones.Features.Count,
+                    filteredZones.Length
+                );
+
+                return filteredZones;
             });
         }
 
@@ -47,22 +77,85 @@ namespace Api
 
         public async Task<Forecast[]> GetForecastByZoneAsync(string zoneId)
         {
-            // Create an exception every 5 calls to simulate and error for testing
-            forecastCount++;
-
-            if (forecastCount % 5 == 0)
+            using var logScope = logger.BeginScope(new Dictionary<string, object>
             {
-                throw new Exception("Random exception thrown by NwsManager.GetForecastAsync");
-            }
+                ["ZoneId"] = zoneId,
+                ["RequestNumber"] = Interlocked.Increment(ref forecastCount)
+            });
 
-            var zoneIdSegment = HttpUtility.UrlEncode(zoneId);
-            var zoneUrl = $"https://api.weather.gov/zones/forecast/{zoneIdSegment}/forecast";
-            var forecasts = await httpClient.GetFromJsonAsync<ForecastResponse>(zoneUrl, options);
-            return forecasts
-                   ?.Properties
-                   ?.Periods
-                   ?.Select(p => (Forecast)p)
-                   .ToArray() ?? [];
+            // Record the request in our metrics
+            NwsManagerDiagnostics.forecastRequestCounter.Add(1);
+            var stopwatch = Stopwatch.StartNew();
+
+            // Create a trace activity
+            using var activity = NwsManagerDiagnostics.activitySource.StartActivity("GetForecastByZoneAsync");
+            activity?.SetTag("zone.id", zoneId);
+
+            logger.LogInformation("🚀 Starting forecast request for zone {ZoneId}", zoneId);
+
+            try
+            {
+                // Create an exception every 5 calls to simulate an error for testing
+                if (forecastCount % 5 == 0)
+                {
+                    throw new Exception("Random exception thrown by NwsManager.GetForecastAsync");
+                }
+
+                var zoneIdSegment = Uri.EscapeDataString(zoneId);
+                var forecasts = await httpClient.GetFromJsonAsync<ForecastResponse>($"zones/forecast/{zoneIdSegment}/forecast", options);
+                stopwatch.Stop();
+
+                // Record the request duration
+                var tags = new KeyValuePair<string, object?>[]
+                {
+          new KeyValuePair<string, object?>("zone.id", zoneId)
+                };
+                NwsManagerDiagnostics.forecastRequestDuration.Record(stopwatch.Elapsed.TotalSeconds, tags);
+                activity?.SetTag("request.success", true);
+
+                var result = forecasts
+                    ?.Properties
+                    ?.Periods
+                    ?.Select(p => (Forecast)p)
+                    .ToArray() ?? [];
+
+                logger.LogInformation(
+                    "📊 Retrieved forecast for zone {ZoneId} in {Duration:N0}ms with {PeriodCount} periods",
+                    zoneId,
+                    stopwatch.Elapsed.TotalMilliseconds,
+                    result.Length
+                );
+
+                return result;
+            }
+            catch (HttpRequestException ex)
+            {
+                stopwatch.Stop();
+                NwsManagerDiagnostics.failedRequestCounter.Add(1);
+                activity?.SetTag("request.success", false);
+
+                logger.LogError(
+                    ex,
+                    "❌ Failed to retrieve forecast for zone {ZoneId}. Status: {StatusCode}",
+                    zoneId,
+                    ex.StatusCode
+                );
+                throw;
+            }
+            catch (Exception ex)
+            {
+                stopwatch.Stop();
+                NwsManagerDiagnostics.failedRequestCounter.Add(1);
+                activity?.SetTag("request.success", false);
+
+                logger.LogError(
+                    ex,
+                    "❌ Unexpected error fetching forecast for zone {ZoneId} after {ElapsedMs}ms",
+                    zoneId,
+                    stopwatch.Elapsed.TotalMilliseconds
+                );
+                throw;
+            }
         }
     }
 }
@@ -75,7 +168,7 @@ namespace Microsoft.Extensions.DependencyInjection
         {
             services.AddHttpClient<Api.NwsManager>(client =>
             {
-                client.BaseAddress = new Uri("https://api.weather.gov/");
+                client.BaseAddress = new Uri("https://weather-api");
                 client.DefaultRequestHeaders.Add("User-Agent", "Microsoft - .NET Aspire Demo");
             });
 
@@ -84,7 +177,8 @@ namespace Microsoft.Extensions.DependencyInjection
             // Add default output caching
             services.AddOutputCache(options =>
             {
-                options.AddBasePolicy(builder => builder.Cache());
+                options.AddBasePolicy(builder => builder.Tag("AllCache")
+                .Cache());
             });
 
             return services;
@@ -100,8 +194,7 @@ namespace Microsoft.Extensions.DependencyInjection
                     return TypedResults.Ok(zones);
                 })
                 .CacheOutput(policy => policy.Expire(TimeSpan.FromHours(1)))
-                .WithName("GetZones")
-                .WithOpenApi();
+                .WithName("GetZones");
 
             app.MapGet("/forecast/{zoneId}", async Task<Results<Ok<Api.Forecast[]>, NotFound>> (Api.NwsManager manager, string zoneId) =>
                 {
@@ -116,8 +209,7 @@ namespace Microsoft.Extensions.DependencyInjection
                     }
                 })
                 .CacheOutput(policy => policy.Expire(TimeSpan.FromMinutes(15)).SetVaryByRouteValue("zoneId"))
-                .WithName("GetForecastByZone")
-                .WithOpenApi();
+                .WithName("GetForecastByZone");
 
             return app;
         }

@@ -1,4 +1,11 @@
+using Azure.Identity;
+using Azure.Security.KeyVault.Secrets;
+using Microsoft.Extensions.Configuration;
+
+
 var builder = WebApplication.CreateBuilder(args);
+
+builder.AddRedisOutputCache("cache");
 
 builder.AddServiceDefaults();
 
@@ -7,6 +14,12 @@ builder.AddServiceDefaults();
 builder.Services.AddOpenApi();
 
 builder.Services.AddNwsManager();
+
+// builder.Configuration.AddAzureKeyVaultSecrets(connectionName: "key-vault");
+
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(m => m.AddMeter("NwsManagerMetrics"))
+    .WithTracing(m => m.AddSource("NwsManager"));
 
 var app = builder.Build();
 

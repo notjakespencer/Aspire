@@ -1,3 +1,4 @@
+﻿using Microsoft.Extensions.Caching.Memory;
 using System.Text.Json;
 using System.Web;
 
@@ -14,6 +15,8 @@ public class NwsManager(HttpClient client)
         return zones ?? [];
     }
 
+
+    private static int forecastCount = 0;
     public async Task<Forecast[]> GetForecastByZoneAsync(string zoneId)
     {
         var forecast = await client.GetFromJsonAsync<Forecast[]>($"forecast/{HttpUtility.UrlEncode(zoneId)}", options);
